@@ -8,132 +8,110 @@ from cStringIO import StringIO
 import struct
 from datetime import datetime
 
-CLIENT_MAGIC_STRING = 'TTDPATCH'
-SERVER_MAGIC_STRING = 'TTDPATCHSERVER'
 SERVER_VERSION = 1
 SERVER_PORT = 5483
 
 HANDSHAKE_TIMEOUT = 60
 TICK_INTERVAL = 1 # 27.0/1000.0
-RAND_CHECK_INTERVAL = 100   # send a 0x31 every x ticks
+RAND_CHECK_INTERVAL = 100   # send a heartbeat_with_rand every x ticks
 
 # dict of code -> (name, state-tuple, [(name, fmt)])
-TYPES = {
-    0x01: ('action_data', 'valid', [('data', '~B')]),
-    0x02: ('action_flush', 'valid', []),
+CLIENT_TYPES = {
+    0x01: ('action', 'valid'),
+    0x02: ('action_flush', 'valid'),
     
-    0x30: ('heartbeat', None, []),
-    0x31: ('heartbeat_with_rand', None, []),
+    0x40: ('rand_value', 'valid'),
     
-    0x40: ('rand_value', 'valid', [('value', 'I')]),
+    0x45: ('sync_data', 'recv_sync'),
     
-    0x44: ('sync_get', None, []),
-    0x45: ('sync_data', 'recv_sync', [('data', '~I')]),
-    0x46: ('sync_heartbeat', None, []),
+    0x50: ('rename', 'valid'),
+    0x54: ('chat', 'valid'),
     
-    0x80: ('server_quit', 'valid', [('password', '16s')]),
-    0x81: ('kick_slot', 'valid', [('password', '16s')]),
+    0x80: ('server_quit', 'valid'),
+    0x81: ('player_kickban', 'valid'),
+    0x82: ('player_kick', 'valid'),
     
-    0xF1: ('slot_info', None, [('data', '~I')]),
-    0xF2: ('set_slot', 'wait_client_slot', [('slot', 'B'), ('password', '16s')]),
-    0xF3: ('slot_ok', None, []),
-    0xF4: ('slot_err', None, []),
-    0xF5: ('newgrf_info', None, []),
+    0xF0: ('hello', 'wait_hello'),
+    0xF1: ('password', 'wait_password'),
+    0xF3: ('set_slot', 'wait_slot'),
+    0xF5: ('set_metainfo', 'wait_metainfo'),
 }
 
-# dict of name -> (code, [(name, fmt)])
-_type_names = dict([(name, (code, data_fmt)) for (code, (name, states, data_fmt)) in TYPES.iteritems()])
-
-def hex (bytes) :
-    return ' '.join(['%#04x' % ord(b) for b in bytes])
+SERVER_TYPES = {
+    'action': 0x01,
     
+    'heartbeat': 0x30,
+    'heartbeat_with_rand': 0x31,
+    
+    'sync_get': 0x44,
+    'sync_data': 0x45,
+    
+    'client_join': 0x51,
+    'client_rename': 0x52,
+    'client_quit': 0x53,
+    'chat': 0x54,
+    
+    'hello': 0xF0,
+    'slot_info': 0xF2,
+    'initial_client': 0xF4,
+    'wait_sync': 0xF6,
+    
+    'error': 0xFE,
+    'abort': 0xFF,
+}
+
+class BaseClientError (Exception) :
+    type = None
+    code = None
+    
+    def __init__ (self, type=None) :
+        self.type = type
+    
+    def errorCode (self) :
+        return self.code | (self.type << 8)
+    
+class BaseClientAbort (Exception) :
+    pass
+    
+class InvalidStateError (BaseClientAbort) :
+    code = 0x01
+    
+class ZeroLengthError (BaseClientAbort) :
+    code = 0x02
+
+class InvalidFrameNumberError (BaseClientAbort) :
+    code = 0x03
+    
+class InvalidRandomSeedError (BaseClientAbort) :
+    code = 0x04
+    
+class WrongVersionError (BaseClientAbort) :
+    code = 0x05
+    
+class ServerIsFullError (BaseClientAbort) :
+    code = 0x06
+    
+class UnknownTypeError (BaseClientAbort) :
+    code = 0x07
+    
+class WrongPasswordError (BaseClientError) :
+    code = 0x10
+    
+class InvalidPlayerError (BaseClientError) :
+    code = 0x11
+    
+class SlotInUseError (BaseClientError) :
+    code = 0x12
+    
+class InvalidNameError (BaseClientError) :
+    code = 0x13
+    
+class NameInUseError (BaseClientError) :
+    code = 0x14
+
 def log (msg) :
     n = datetime.now()
     print "%s.%03.0d %s" % (n.strftime('%H:%M:%S'), n.microsecond/1000, msg)
-
-class NotEnoughDataError (Exception) : 
-    pass
-
-class Buffer (object) :
-    # for mark/reset
-    __position = None
-    
-    # the buffer
-    buf = None
-    
-    def __init__ (self, str) :
-        self.buf = StringIO(str)
-    
-    def read (self, size=None) :
-        if size :
-            return self.buf.read(size)
-        else :
-            return self.buf.read()
-    
-    def readAll (self, size) :
-        """
-            Returns either size bytes of data, or raises NotEnoughDataError
-        """
-        
-        data = self.buf.read(size)
-        
-        if len(data) < size :
-            raise NotEnoughDataError()
-        else :
-            return data
-        
-    def readStruct (self, fmt) :
-        """
-            Uses readAll to read struct data, and then unpacks it
-        """
-        
-        fmt_size = struct.calcsize(fmt)
-        data = self.readAll(fmt_size)
-        
-        return struct.unpack(fmt, data)
-        
-    def readVarLen (self, len_type) :
-        """
-            Return the data part of a <length><data> structure
-            len_type indicates what type length has
-        """
-        
-        size, = self.readStruct(len_type)
-        return self.readAll(size)
-    
-    def peek (self, len=None) :
-        pos = self.buf.tell()
-        data = self.read(len)
-        self.buf.seek(pos)
-        
-        return data
-    
-    def mark (self) :
-        """
-            Set a mark that can be later rolled back to with .reset()
-        """
-        
-        self.__position = self.buf.tell()
-    
-    def reset (self) :
-        """
-            Rolls the buffer pack to the position set earlier with mark()
-        """
-        
-        if self.__position is not None :
-            self.buf.seek(self.__position)
-            self.__position = None
-        else :
-            raise Exception("Must mark() before calling reset()")
-            
-    def processWith (self, func) :  
-        try :
-            while True :
-                self.mark()  # mark the position of the packet we are processing
-                func(self)
-                
-        except NotEnoughDataError :
-            self.reset() # reset position back to the start of the packet
 
 class ServerConnection (protocol.Protocol) :
     __state = 'init'
@@ -153,12 +131,15 @@ class ServerConnection (protocol.Protocol) :
     # a list of action data that we collect in here until we get an action_flush
     action_buffer = None
     
+    # the player's name
+    player_name = None
+    
     def __init__ (self) :
         self.recvbuffer = ''
         self.action_buffer = []
         
     def _set_state (self, state) :
-        if state in ('init', 'wait_client_handshake', 'wait_client_slot', 'send_sync', 'valid', 'recv_sync') :
+        if state in ('init', 'wait_hello', 'wait_password', 'wait_slot', 'wait_metainfo', 'send_sync', 'valid', 'recv_sync') :
             self.__state = state
         else :
             raise Exception("Invalid state '%s'" % state)
@@ -174,7 +155,7 @@ class ServerConnection (protocol.Protocol) :
         """
             State is now wait_client_handshake, start the timeout timer
         """
-        self.state = 'wait_client_handshake'
+        self.state = 'wait_hello'
         self.handshake_timeout = reactor.callLater(HANDSHAKE_TIMEOUT, self.err, "handshake timeout expired")
         self.log("connected")
     
@@ -203,14 +184,27 @@ class ServerConnection (protocol.Protocol) :
             processPacket() until there's either no data or a packet fragment left
         """
         
-        buf = Buffer(self.recvbuffer + data)
+        buf = buffer.Buffer(self.recvbuffer + data)
         
         # process packets until there are no more of them
 
         try :
             buf.processWith(self.processPacket)
+        except BaseClientAbort, e :
+            self.do_abort(e.errorCode())
+            
+            self.log("closing connection")
+            self.transport.loseConnection()
+            
+        except BaseClientError, e :
+            self.do_error(e.errorCode())
+            
         except Exception, e :
-            self.err(e)
+            self.log("unknown exception %s: %s" % (type(e), e))
+            
+            self.log("closing connection")
+            self.transport.loseConnection()
+            
             raise
             
         # stuff remaining data back into recvbuf
@@ -219,119 +213,194 @@ class ServerConnection (protocol.Protocol) :
     def processPacket (self, buf) :
         bytes = buf.peek()
         self.log("processing %d bytes: %s" % (len(bytes), hex(bytes)))
-    
-        # do we need to read the handshake?
-        if self.state == 'wait_client_handshake' :
-            magic_str, client_version = buf.readStruct('%dsI' % len(CLIENT_MAGIC_STRING))
-            # stop the timeout
-            self.handshake_timeout.cancel()
+        
+        type, = buf.readStruct('B')
+        
+        try :
+            try :
+                type_name, type_states = TYPES[type]
+            except IndexError :
+                self.log("unknown type %d" % type)
+                raise UnknownTypeError()
             
-            if magic_str != CLIENT_MAGIC_STRING :
-                raise Exception("wrong magic string received: %s" % magic_str)
-            
-            self.log("got handshake with version %s, sending slot_info" % client_version)
-            
-            # send our half of the handshake
-            self.transport.write("%s%s" % (SERVER_MAGIC_STRING, struct.pack('IB', SERVER_VERSION, 0x00)))
-            
-            # send the slot info
-            self.sendPacket('slot_info', self.getSlotInfo())
-            self.state = 'wait_client_slot'
-        else :    
-            # read the frame/type
-            frame, type = buf.readStruct('IB')
-            
-            # get the type info
-            if type in TYPES :
-                type_name, type_states, type_data_fmt = TYPES[type]
-            else :
-                raise Exception("unknown type %d" % type)
-            
-            # check the state
-            if not type_states or self.state not in type_states :
-                raise Exception("Can't send '%s' in state '%s'" % (type_name, self.state))
-            
+            if self.state not in type_states :
+                self.log("can't do %s in state %s" % (type_name, self.state))
+                raise InvalidStateError()
+                
             # get the handler for it
             func = getattr(self, 'on_%s' % type_name, None)
             
             if not func :
-                raise Exception("Type %s is not implemented" % type_name)
+                self.log("type %d is not implemented" % (type_name, ))
+                raise UnknownTypeError()
             
             # call the handler
-            func(buf, frame)
+            func(buf)
+        except BaseClientError, e :
+            e.type = type
+            raise
+        
+    # sending replies
+    def _startSend (self, type_name) :
+        buf = buffer.Buffer()
+        buf.writeStruct('B', SERVER_TYPES[type_name])
+        
+        return buf
+        
+    def _doSend (self, buf) :
+        # write out the reply
+        self.transport.write(buf.getvalue())        
     
-    # the different packet types    
-    def on_set_slot (self, buf, frame) :    
-        slot, password = buf.readStruct('B16s')
+    # in/out methods
+    def do_abort (self, error_code) :
+        o = self._startSend('abort')
+        o.writeStruct('H', error_code)
+        self._doSend(o)
+    
+    def do_error (self, error_code) :
+        o = self._startSend('error')
+        o.writeStruct('H', error_code)
+        self._doSend(o)
+        
+    def on_hello (self, i, o) :
+        client_version, = i.readStruct('I')
+        
+        # stop the timeout
+        self.handshake_timeout.cancel()
+        
+        self.log("got handshake with version %s, sending slot_info" % client_version)
+        
+        # send our half of the handshake
+        o.writeStruct('IB', SERVER_VERSION, 0x00)
+        
+        # send the slot info
+        self.do_slot_info()
+        self.state = 'wait_client_slot'
+   
+    def do_slot_info (self) :
+        o = self._startSend('slot_info')
+        
+        pwd_mask = 0
+        used_mask = 0
+        name_strs = []
+        
+        for id, (pwd, client) in enumerate(self.factory.clients) :
+            if pwd :
+                pwd_mask |= 2**i
+                
+            if client :
+                used_mask |= 2**1
+            
+            name_strs.append(client.player_name + '\x00')
+        
+        names_str = ''.join(name_strs)
+        
+        o.writeStruct('BB', pwd_mask, used_mask)
+        o.writeVarLen(names_str, 'H')
+        
+        self._doSend(o)
+        
+    def on_set_slot (self, i) :    
+        slot, password = i.readStruct('B16s')
         
         try :
-            self.factory.setClient(slot, password, self)
-        except Exception, e :
-            self.sendPacket('slot_err')
+            is_initial_client = self.factory.setClient(slot, password, self)
+        except :
+            raise
         else :
             self.player_slot = slot
-            self.sendPacket('slot_ok')
-            self.doSync()
+            
+            if is_initial_client :
+                self.do_initial_client()
+            else :
+                self.do_wait_sync()
+                self.doSync()
+            
+    def do_initial_client (self) :
+        o = self._startSend('intial_client')
+        
+        self._doSend(o)
+        
+        self.state = 'wait_metainfo'
+        
+    def do_wait_sync (self) :
+        o = self._startSend('wait_sync')
+        
+        self._doSend(o)
+        
+        self.state = 'send_sync'
                     
-    def on_sync_data (self, buf, frame) :
-        data = buf.readVarLen('I')
+    def on_sync_data (self, i) :
+        data = i.readVarLen('I')
         
         self.sync_target.gotSync(data)
         self.sync_target = None
+        
         self.state = 'valid'
+    
+    def do_sync_data (self, data) :
+        o = self._startSend('sync_data')
+        
+        o.writeVarLen(data, 'I')
+        
+        self._doSend(o)
                 
-    def on_action_data (self, buf, frame) :
-        data = buf.readVarLen('B')
+    def on_action (self, i) :
+        data = i.readVarLen('B')
         
         self.action_buffer.append(data)
                 
-    def on_action_flush (self, buf, frame) :     
+    def on_action_flush (self, i) :     
         self.factory.addActions(self.action_buffer)
         self.action_buffer = []
+        
+    def do_action (self, frame, data) :
+        o = self._startSend('action')
+        
+        o.writeStruct('I', frame)
+        o.writeVarLen(data, 'B')
+        
+        self._doSend(o)
+        
+    def do_heartbeat (self, frame) :
+        o = self._startSend('heartbeat')
+        
+        o.writeStruct('I', frame)
+        
+        self._doSend(o)
+        
+    def do_heartbeat_with_rand (self, frame) :
+        o = self._startSend('heartbeat_with_rand')
+        
+        o.writeStruct('I', frame)
+        
+        self._doSend(o)
                 
-    def on_rand_value (self, buf, frame) :       
-        value, = buf.readStruct('I')
+    def on_rand_value (self, i) :       
+        frame, value = i.readStruct('II')
         
         self.factory.gotClientRand(self, frame, value)
+        
+    def do_sync_get (self) :
+        o = self._startSend('sync_data')
+        
+        self._doSend(o)
     
-    # send API
-    def sendPacket (self, type_name, data='', frame=None) :
-        if frame is None :
-            frame = self.factory.frame
-            
-        type_code = _type_names[type_name][0]
-        
-        self.log("sending %s for frame %d with %d bytes: %s" % (type_name, frame, len(data), hex(data)))
-        
-        self.transport.write(struct.pack('IB%ds' % len(data), frame, type_code, data))
-        
-    def getSlotInfo (self) :
-        p_mask = 0
-        c_mask = 0
-        p_strs = []
-        
-        for i, (p, c) in enumerate(self.factory.clients) :
-            if p :
-                p_mask |= 2**i
-                
-            if c :
-                c_mask |= 2**1
-            
-            p_strs.append('player%d\0' % i)
-        
-        p_str = ''.join(p_strs)
-        
-        return struct.pack('IBB%ds' % len(p_str), (1 + 1 + len(p_str)), p_mask, c_mask, p_str)
-    
+    # state-handling methods
     def doSync (self) :
-        if self.factory.getSyncFor(self) :
-            self.state = 'send_sync'
-        else :
-            # noone to sync with
-            self.state = 'valid'
+        """
+            Ask the factory to get someone to sync us up
+       """
+       
+        self.factory.getSyncFor(self)
     
     def gotSync (self, data) :
-        self.sendPacket('sync_data', struct.pack('I%ds' % len(data), len(data), data))
+        """
+            We have received the sync data from some other client
+        """
+        
+        self.do_sync_data(data)
+        
         self.state = 'valid'
         self.factory.syncDone()
     
@@ -349,31 +418,25 @@ class ServerConnection (protocol.Protocol) :
         
         self.state = 'recv_sync'
         self.sync_target = connection
-        self.sendPacket('sync_get')
+        self.do_sync_get()
         
         return True
     
     def pushAction (self, frame, action) :
-        self.sendPacket('action_data', action, frame=frame)
+        self.do_action(frame, data)
     
     def doHeartbeat (self, frame) :
         if frame % RAND_CHECK_INTERVAL == 0 :
-            type = 'heartbeat_with_rand'
+            self.do_heartbeat_with_rand(frame)
         else :
-            type = 'heartbeat'
-            
-        self.sendPacket(type, frame=frame)
+            self.do_hearbeat(frame)
     
     def onDesync (self) :
         """
             We sent an invalid random seed value
         """
-        self.err("Wrong random seed value!")
-    
-    # logging
-    def err (self, reason) :
-        self.transport.loseConnection()
-        log("%s errored out: %s" % (self, reason))
+        
+        self.abort(InvalidRandomSeedError(CLIENT_TYPES.index('rand_value')))
         
     def log (self, msg) :
         log("%s: %s" % (self, msg))
@@ -426,14 +489,17 @@ class Server (protocol.ServerFactory) :
         old_password, old_connection = self.clients[index]
         
         if old_connection :
-            raise Exception("Slot already occupied")
+            raise SlotInUseError()
         
         if not old_password or password == old_password :
             self.clients[index] = password, connection
         else :
-            raise Exception("Wrong password for slot")
+            raise WrongPasswordError()
         
         self._updateHeartbeat()
+        
+        # is this the only client?
+        return len([0 for p, c in self.clients if c]) == 1
     
     def delClient (self, index, remove_password=True) :
         """
@@ -554,6 +620,6 @@ class Server (protocol.ServerFactory) :
         log("server: %s" % msg)
         
 if __name__ == '__main__' :
-    reactor.listenTCP(5483, Server())
+    reactor.listenTCP(SERVER_PORT, Server())
     reactor.run()
     

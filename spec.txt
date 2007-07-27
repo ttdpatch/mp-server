@@ -1,0 +1,333 @@
+-------------------------------------------
+
+    TTD PATCH MULTIPLAYER SPECIFICATION    
+
+-------------------------------------------
+
+-------------------
+ EXECUTIVE SUMMARY
+-------------------
+    general :
+        - the server not aware of the state of the TTD game itself, it blindly 
+          forwards state/events as-is. Clients must handle invalid events 
+          themselves
+        
+    in origional spec, implemented :
+        - maintains a list of connected players
+        - allows players to reclaim their slot after disconnecting
+        - handles transfering the initial game state from an existing player to
+          a new one
+        - relays events from one player to the other players in a consistent
+          order
+        - ensures that events occur at the same time for all players
+        - checks that all clients are synchronized via comparing random 
+          generator seeds
+        
+    in origional spec, not implemented :    
+        - general server management tasks (quit server/kick player/clear slot)
+        - provides info on what newgrfs are in use
+        - player names
+        
+    not in oritional spec, additions/modifications :
+        - the handshake also follows the normal packet format
+        - framenumber is no longer part of the header, but a normal parameter
+        - fatal/non-fatal errors and their codes
+        - presence info (tell other players when a player joins/quits/changes 
+          name)
+        - chat (or is that via 0x01?)
+        - refine initial-client-connects-to-server aspect to make it more 
+          explicit (some kind of sync_data alternative that tells the client 
+          to generate it's own map info)
+        - make server a bit more aware of the TTD game state, so that it knows
+          what kind of map is loaded, what year the game is in, etc etc
+          
+    not in origional spec, suggestions :          
+        - server name
+        - a UDP query interface to let clients request above game info
+    
+    questions:
+        - spectators?
+        - more than eight players?
+        - a player-id field in 0x01 packets?
+
+---------------
+ PROTOCOL SPEC
+---------------
+        
+Packet format (common to all packets) :
+<uns8 type><type-specific data>
+
+spec format
+<type>: <name>
+    <data format>
+    info
+    
+------------------
+ CLIENT -> SERVER
+------------------
+
+0x01: action
+    <uns16 length><length*uns8 data>
+    - the client has executed some action
+
+0x02: action_flush
+    void
+    - the client has sent all actions for this frame, action list may now be 
+      sent to other clients
+
+0x40: rand_value
+    <uns32 frame><uns32 value>
+    - the client's random gen seed in <frame> was <value>
+
+0x45: sync_data
+    <uns32 length><length*uns8 data>
+    - the initial game state
+    
+0x50: client_rename
+    <uns8 length><length*uns8 name>
+    - change this player's name
+    
+0x54: chat
+    <uns8 target><uns16 length><length*uns8 msg>
+    - send a message to a target, one of
+        a) 0       dunno, console command?
+        b) 255     everyone
+        c) 0<x<255 a specific player
+
+0x80: server_quit
+    <16*uns8 password>
+    - make the server shut down
+    
+0x81: player_kickban
+    <uns8 player><16*uns8 password>
+    - remove the player from server and stop IP from connecting again
+
+0x82: player_kick
+    <uns8 player><16*uns8 password>
+    - remove the player from server
+
+0xF0: hello
+    <uns32 version>
+    - client tells server what version of the protocol it is using
+
+0xF1: connect_password
+    <16*uns8 password>
+    - the client must use this to provide a password if indicated in 0xF0 hello
+
+0xF3: set_slot
+    <uns8 slot><16*uns8 password><uns8 length><length*uns8 name>
+    - the player claims the given slot. If the slot 
+        a) is not already occupied 
+        b) doesn't have a password or the given password matches that password
+      the server will set the slot to this player, password and name
+      
+0xF5: set_metainfo
+    ?
+    - the server must update its meta-info (map type, name, year, etc)
+
+------------------
+ SERVER -> CLIENT
+------------------
+        
+0x01: action
+    <uns32 frame><uns8 length><length*uns8 data>
+    - the client should execute this action when the heartbeat for the given
+      frame arrives
+
+0x30: heartbeat
+    <uns32 frame>
+    - the client should execute all actions up to and including the given frame
+    
+0x31: heartbeat_with_rand
+    <uns32 frame>
+    - the client should execute all actions up to and including the given
+      frame, and respond with a 0x40
+
+0x44: sync_get
+    void
+    - the client should reply with a 0x45
+    
+0x45: sync_data
+    <uns32 length><length*uns8 data>
+    - initial game data, from another client
+    
+0x51: client_join
+    <uns8 player><uns8 length><length*uns8 name>
+    - a new client has joined as the given slot and the given name
+    
+0x52: client_rename
+    <uns8 player><uns8 length><length*uns8 name>
+    - a client has changed name
+
+0x53: client_quit
+    <uns8 player>
+    - a client has left the game
+   
+0x54: chat
+    <uns8 source><uns8 target><uns16 length><length*uns8 msg>
+    - a chat message from source to target (see chat_send)
+
+0xF0: hello
+    <uns32 version><uns8 status>
+    - the server tells the client what version of the protocol it is using, as
+      well as info pertinent to connecting. Status is a bitmask:
+        0x01        password required to connect
+    
+0xF2: slot_info
+    <uns8 occupied_mask><uns8 passwords_mask><uns16 names_length>8*<zero-terminated player name>
+    - Tells the client what slots are in use, and what players are using them
+
+0xF4: initial_client
+    void
+    - player is the first client in the game, and must generate a new game and
+      send a 0xF5
+      
+0xF6: wait_sync
+    void
+    - player will receive a sync_data packet shortly
+
+0xFE: error    
+    <uns16 code>
+    - message rejected, try again
+    
+0xFF: fatal_error
+    <uns16 code>
+    - message rejected, connection will be closed
+
+-------------
+ ERROR CODES
+-------------
+The first byte indicates the command that this error is in reponse to, the 
+second the error code.
+
+0x0101      *FATAL* cannot do this in this state
+0x0201      
+0x4001
+0x4501 
+0x5001
+0xF001
+0xF101
+0xF301
+0xF501
+
+0x0102      *FATAL* zero length
+0x4502
+0x5002
+0x8102
+0x8202
+0xF302
+
+0x4003      *FATAL* invalid frame number
+0x4004      *FATAL* wrong random seed value (i.e. desync)
+0xF005      *FATAL* unsupported client version
+0xF006      *FATAL* server is full
+0x--07      *FATAL* unknown type
+
+0x8010      wrong password
+0x8110
+0x8210
+0xF110
+0xF310
+
+0x8111      invalid player
+0x8211
+0xF311
+
+0xF312      slot in use
+
+0x5013      invalid name
+0xF313      
+0x5014      name already in use
+0xF314      
+
+    
+-------------
+ THE PROCESS
+-------------
+    When a client first connects, it is in the wait_hello stage.
+    
+    wait_hello:
+        The server waits for the client to send a 0xF0 hello message with its 
+        protocol version. If succesfull, the server replies with a 0xF0 hello. 
+        If the server requires a password, the connection goes into the 
+        wait_password state, otherwise, wait_slot.
+    
+    wait_password:
+        The server waits for the client to send a 0xF1 connect_password. If the
+        password is correct, the connection goes to wait_slot stage.
+    
+    wait_slot:
+        The server sends a 0xF2 slot_info message, telling the client what
+        slots it may use. The server waits for the client to reply with an 0xF3
+        set_slot. If this succeeds and
+            a) this is the first client in this game
+                The server sends a 0xF4 initial_client packet and the connection
+                goes into the wait_metainfo state
+            b) there are other clients
+                The server sends a 0xF6 wait_sync and the connection goes
+                into the send_sync state
+        
+        NOTE: If any other client claims a slot/renames themselves/quits while
+        the client is in this stage, the server will send an additional 0xF2 
+        slot_info. 
+                
+    wait_metainfo:
+        The client must generate a new game, and then send a 0xF5 set_metainfo,
+        whereupon they enter the active state
+        
+        NOTE: If any other client claims a slot/renames themselves/quits while
+        the client is in this stage, the server will send an additional 0xF2 
+        slot_info.
+    
+    send_sync:
+        The server 
+            a) sends a 0xF6 wait_sync packet to the new client
+            b) broadcasts a 0x51 client_join to all players in the active state
+            c) pause the heartbeat
+            d) chooses one player in the active state, and transferrs it to the
+               recv_sync state
+        
+        Once the server has received the sync_data from the player in part d, 
+        and sent it to the new client, it will renable the heartbeat, and both
+        connections will enter the active state.
+        
+        NOTE: If any other client claims a slot/renames themselves/quits while
+        the client is in this stage, the server will send an additional 0xF2 
+        slot_info.         
+    
+    active:
+        The main gameplay state. 
+        
+        Player may send:
+            0x01 action
+            0x02 action_flush
+            0x40 rand_value
+            0x50 client_rename
+            0x54 chat
+            0x80 server_quit
+            0x81 player_kickban
+            0x82 player_kick
+            0xF5 set_metainfo
+        
+        Server may send:
+            0x01 action
+            0x30 heartbeat
+            0x31 heartbeat_with_rand
+            0x51 client_join
+            0x52 client_rename
+            0x53 client_quit
+            0x54 chat
+            
+        If the server looses the connection to the client, the connection
+        enters the dead state.
+    
+    recv_sync:
+        The server sends a 0x44 sync_get to the client. The client must reply
+        with a 0x45 sync_data, whereupon it enters the active state again.
+    
+    dead:
+        If the player has a slot, the server clears the player's slot, and 
+        broadcasts a 0x53 client_quit event to all active players.
+    
+    NOTE: a 0xFE at any time will keep the client in its current state. A 0xFF
+          will send it into the dead state.
